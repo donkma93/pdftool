@@ -1,0 +1,6 @@
+APP_NAME = "PDFTOOL"
+APP_VERSION = "1.0.0"
+GITHUB_OWNER = "donkma93"
+GITHUB_REPO = "pdftool"
+GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+

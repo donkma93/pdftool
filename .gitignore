@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+
+.codegraph/
+.pytest_cache/
+.mypy_cache/
+
+PDFTextEditor_*.spec

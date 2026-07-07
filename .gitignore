@@ -3,6 +3,7 @@ __pycache__/
 
 build/
 dist/
+release/
 
 .codegraph/
 .pytest_cache/

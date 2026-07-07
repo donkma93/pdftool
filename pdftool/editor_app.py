@@ -20,7 +20,7 @@ from .pdf_engine import (
     styled_wrapped_lines,
 )
 from .text_layout import fit_font_size, required_text_height, wrap_text_for_canvas, wrap_text_for_pdf
-from .update_checker import is_newer_version, latest_github_tag, open_latest_release
+from .update_checker import download_latest_installer, is_newer_version, latest_github_tag, open_downloaded_installer, open_latest_release
 from .version import APP_VERSION
 
 
@@ -184,10 +184,21 @@ class PdfParagraphEditor(tk.Tk):
         if is_newer_version(latest_tag, APP_VERSION):
             should_open = messagebox.askyesno(
                 "Có bản cập nhật mới",
-                f"Phiên bản hiện tại: v{APP_VERSION}\nPhiên bản mới nhất: {latest_tag}\n\nMở trang tải bản mới?",
+                f"Phiên bản hiện tại: v{APP_VERSION}\nPhiên bản mới nhất: {latest_tag}\n\nTải bản cài đặt mới?",
             )
             if should_open:
-                open_latest_release(latest_tag)
+                try:
+                    installer_path = download_latest_installer(latest_tag)
+                except Exception as exc:
+                    messagebox.showerror("Không thể tải bản cập nhật", f"Không tải được file cài đặt:\n{exc}")
+                    open_latest_release(latest_tag)
+                    return
+                if installer_path is None:
+                    messagebox.showinfo("Chưa có file cài đặt", "Release mới chưa có file cài đặt. Chương trình sẽ mở trang release.")
+                    open_latest_release(latest_tag)
+                    return
+                messagebox.showinfo("Đã tải bản cập nhật", f"Đã tải file:\n{installer_path}\n\nHãy đóng PDFTOOL rồi chạy file cài đặt để cập nhật.")
+                open_downloaded_installer(installer_path)
             return
         messagebox.showinfo("Đã là bản mới nhất", f"Phiên bản hiện tại: v{APP_VERSION}\nTag mới nhất trên GitHub: {latest_tag}")
 

@@ -1,6 +1,6 @@
 APP_NAME = "PDFTOOL"
 APP_TITLE = "PDF Visual Text Editor"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "donpv"
 APP_COPYRIGHT_YEAR = "2026"
 APP_COPYRIGHT = f"© {APP_COPYRIGHT_YEAR} {APP_AUTHOR}. All rights reserved."

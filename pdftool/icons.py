@@ -4,11 +4,15 @@ Production-style toolbar icons for PDFTOOL.
 Drawn with Tk Canvas primitives (no external assets) using a consistent
 20×20 visual grid, dual-tone palette, and filled shapes inspired by
 modern desktop apps (Fluent / VS Code density).
+
+Also resolves the application `.ico` for the window and packaged EXE.
 """
 
 from __future__ import annotations
 
+import sys
 import tkinter as tk
+from pathlib import Path
 
 
 def icon_palette(active: bool = False) -> dict[str, str]:
@@ -365,49 +369,57 @@ ICON_DRAWERS = {
 }
 
 
+def project_root() -> Path:
+    """Project root (source tree) or PyInstaller extract dir."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent.parent
+
+
+def app_icon_path() -> Path | None:
+    """Locate pdftool.ico for window / taskbar branding."""
+    candidates = [
+        project_root() / "assets" / "pdftool.ico",
+        Path(__file__).resolve().parent.parent / "assets" / "pdftool.ico",
+        Path(sys.executable).resolve().parent / "assets" / "pdftool.ico",
+        Path(sys.executable).resolve().parent / "pdftool.ico",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 def make_app_icon_photo(size: int = 32) -> tk.PhotoImage:
-    """Create a simple in-memory app icon (PDF + green accent)."""
-    # Build via temporary canvas on a hidden root-less approach is awkward;
-    # construct a tiny PPM manually for reliability.
-    # Green document on dark bg.
+    """
+    Load a PhotoImage for iconphoto().
+    Prefers assets/pdftool_*.png / pdftool.png; falls back to a drawn icon.
+    """
+    root = project_root()
+    for name in (f"pdftool_{size}.png", "pdftool_32.png", "pdftool.png"):
+        path = root / "assets" / name
+        if path.is_file():
+            try:
+                return tk.PhotoImage(file=str(path))
+            except tk.TclError:
+                pass
+
+    # Fallback: simple programmatic icon (no external file).
     w = h = size
-    pixels = []
-    for y in range(h):
-        row = []
-        for x in range(w):
-            # background
-            r, g, b = 28, 28, 30
-            # rounded-ish document
-            doc_l, doc_t, doc_r, doc_b = 7, 4, 24, 28
-            if doc_l <= x <= doc_r and doc_t <= y <= doc_b:
-                r, g, b = 245, 245, 245
-            # fold
-            if 18 <= x <= 24 and 4 <= y <= 10 and (x + y) >= 28:
-                r, g, b = 60, 60, 64
-            # accent bar
-            if 10 <= x <= 21 and 22 <= y <= 25:
-                r, g, b = 32, 182, 90
-            # text lines
-            if 10 <= x <= 20 and y in (10, 13, 16):
-                r, g, b = 32, 182, 90
-            row.append(f"{r:02x}{g:02x}{b:02x}")
-        pixels.append("{" + " ".join(row) + "}")
-    header = f"P6\n{w} {h}\n255\n"
-    # PhotoImage data can use PPM binary; use simpler approach with put?
-    # Use tk PhotoImage blank + put
     img = tk.PhotoImage(width=w, height=h)
+    scale = size / 32.0
     for y in range(h):
         line = []
         for x in range(w):
-            doc_l, doc_t, doc_r, doc_b = 7, 4, 24, 28
-            r, g, b = 28, 28, 30
-            if doc_l <= x <= doc_r and doc_t <= y <= doc_b:
-                r, g, b = 245, 245, 245
-            if 18 <= x <= 24 and 4 <= y <= 10 and (x + y) >= 28:
-                r, g, b = 60, 60, 64
-            if 10 <= x <= 21 and 22 <= y <= 25:
+            sx, sy = x / scale, y / scale
+            r, g, b = 28, 30, 34
+            if 7 <= sx <= 25 and 4 <= sy <= 28:
+                r, g, b = 245, 246, 248
+            if 18 <= sx <= 25 and 4 <= sy <= 10 and (sx + sy) >= 28:
+                r, g, b = 55, 58, 64
+            if 9 <= sx <= 22 and sy in (10, 13, 16):
                 r, g, b = 32, 182, 90
-            if 10 <= x <= 20 and y in (10, 13, 16):
+            if 9 <= sx <= 16 and 22 <= sy <= 26:
                 r, g, b = 32, 182, 90
             line.append(f"#{r:02x}{g:02x}{b:02x}")
         img.put("{" + " ".join(line) + "}", to=(0, y))

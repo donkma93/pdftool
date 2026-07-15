@@ -5,7 +5,16 @@ a = Analysis(
     ['pdf_editor.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('assets/pdftool.ico', 'assets'),
+        ('assets/pdftool.png', 'assets'),
+        ('assets/pdftool_16.png', 'assets'),
+        ('assets/pdftool_32.png', 'assets'),
+        ('assets/pdftool_48.png', 'assets'),
+        ('assets/pdftool_64.png', 'assets'),
+        ('assets/pdftool_128.png', 'assets'),
+        ('assets/pdftool_256.png', 'assets'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +44,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/pdftool.ico',
 )

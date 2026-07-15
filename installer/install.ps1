@@ -15,11 +15,19 @@ Copy-Item -LiteralPath $exeSource -Destination (Join-Path $InstallDir "PDFTextEd
 
 $shortcutDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 $shortcutPath = Join-Path $shortcutDir "PDFTOOL.lnk"
+$exePath = Join-Path $InstallDir "PDFTextEditor.exe"
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = Join-Path $InstallDir "PDFTextEditor.exe"
+$shortcut.TargetPath = $exePath
 $shortcut.WorkingDirectory = $InstallDir
 $shortcut.Description = "PDFTOOL"
+# Prefer embedded EXE icon; fallback to packaged ico if present next to installer.
+$iconCandidate = Join-Path $scriptDir "pdftool.ico"
+if (Test-Path -LiteralPath $iconCandidate) {
+    $shortcut.IconLocation = "$iconCandidate,0"
+} else {
+    $shortcut.IconLocation = "$exePath,0"
+}
 $shortcut.Save()
 
 Write-Host "Đã cài đặt PDFTOOL vào: $InstallDir"

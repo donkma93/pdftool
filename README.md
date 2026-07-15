@@ -69,5 +69,9 @@ PDF không lưu nội dung giống file Word. Bản hiện tại:
 - Khi xuất, chương trình che vùng text cũ bằng nền trắng và ghi text mới lên trên.
 - Giao diện Phase A: menu, tooltip toolbar, status bar, welcome screen, find bar (`Ctrl+F`), phím tắt, recent files.
 - Phase B: thumbnail trang, tab Outlines (bookmark), chuột phải xoay/xóa trang, preview căn giữa, di chuyển box bằng mũi tên.
+- Bước 1 (ổn định): Undo/Redo toàn tài liệu (`Ctrl+Z` / `Ctrl+Y`) cho sửa text, xóa, di chuyển, resize, chèn box.
+- Bước 2: Tìm & thay thế (`Ctrl+H`) — thay 1 chỗ / thay tất cả, không phân biệt hoa thường, có undo.
+- Bước 3: Cài đặt (`Ctrl+,`) — zoom, bước mũi tên, font, recent, undo, xác nhận thay tất cả; lưu `%APPDATA%\PDFTOOL\settings.json`.
+- Icon ứng dụng: `assets/pdftool.ico` (cửa sổ + PyInstaller EXE), branding taskbar Windows (AppUserModelID).
 
 Kết quả tốt nhất với PDF nền trắng, có text thật. PDF scan ảnh cần OCR riêng.

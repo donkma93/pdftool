@@ -1,7 +1,9 @@
 import copy
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import tkinter as tk
 from pathlib import Path
@@ -15,8 +17,10 @@ from .geometry import (
     constrain_rect_to_page,
     resize_handle_points,
 )
-from .icons import draw_icon, make_app_icon_photo
+from .history import EditHistory, HistorySnapshot, clone_blocks
+from .icons import app_icon_path, draw_icon, make_app_icon_photo
 from .models import TextBlock, TextStyleSpan
+from .settings import AppSettings, load_settings, save_settings
 from .pdf_engine import (
     apply_blocks_to_pdf,
     block_has_changes,
@@ -100,6 +104,8 @@ class ToolTip:
 class PdfParagraphEditor(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Apply custom icon immediately so title bar / taskbar pick it up early.
+        self._set_app_icon()
         self.title(f"{APP_TITLE} v{APP_VERSION} — {APP_COPYRIGHT}")
         self.geometry("1280x820")
         self.minsize(1080, 700)
@@ -111,10 +117,11 @@ class PdfParagraphEditor(tk.Tk):
         self.blocks: list[TextBlock] = []
         self.selected_block_id: int | None = None
         self.current_page_index = 0
-        self.zoom = 1.35
+        self.settings = load_settings()
+        self.zoom = float(self.settings.default_zoom)
         self.page_photo: tk.PhotoImage | None = None
         self.page_canvas_item: int | None = None
-        self.page_margin = 24
+        self.page_margin = int(self.settings.page_margin)
         self.page_origin_x = 24
         self.page_origin_y = 24
         self._last_canvas_size: tuple[int, int] = (0, 0)
@@ -129,7 +136,8 @@ class PdfParagraphEditor(tk.Tk):
         self.tool_buttons: dict[str, tk.Canvas] = {}
         self.find_visible = False
         self.find_query = ""
-        self.find_matches: list[tuple[int, int]] = []
+        # (page_index, block_id, start, end) — character offsets in block.text
+        self.find_matches: list[tuple[int, int, int, int]] = []
         self.find_index = -1
         self.inplace_block_id: int | None = None
         self.inplace_window_id: int | None = None
@@ -141,21 +149,50 @@ class PdfParagraphEditor(tk.Tk):
         self.outline_items: list[dict] = []
         self.structure_dirty = False
         self.thumb_max_width = 132
+        self.history = EditHistory(max_steps=self.settings.history_max_steps)
+        self._drag_history_snapshot: HistorySnapshot | None = None
+        self._nudge_undo_open = False
+        self._nudge_history_close_job = None
         self.font_files = available_font_files()
-        self.pdf_font_path = self.font_files.get("Arial") or find_unicode_font(self.font_files)
+        self.pdf_font_path = (
+            self.font_files.get(self.settings.default_font)
+            or self.font_files.get("Arial")
+            or find_unicode_font(self.font_files)
+        )
 
         self._build_ui()
+        # Re-apply icon after UI (some platforms reset it during widget creation).
         self._set_app_icon()
+        self.apply_settings_to_runtime(persist=False)
         self.show_welcome()
         self.update_status_bar()
         self._try_enable_file_drop()
+        if self.settings.check_updates_on_start:
+            self.after(800, self._silent_check_updates_on_start)
 
     def _set_app_icon(self):
+        """Use custom PDFTOOL icon (not the Python default) for window + taskbar."""
+        self._app_icon = None
+        self._app_icon_large = None
+        ico = app_icon_path()
+        if ico is not None and sys.platform.startswith("win"):
+            try:
+                # iconbitmap is the reliable Windows taskbar/title-bar path for .ico
+                self.iconbitmap(default=str(ico))
+                self.iconbitmap(str(ico))
+            except tk.TclError:
+                pass
         try:
             self._app_icon = make_app_icon_photo(32)
-            self.iconphoto(True, self._app_icon)
+            self._app_icon_large = make_app_icon_photo(64)
+            # iconphoto works cross-platform and helps Alt-Tab on some setups
+            self.iconphoto(True, self._app_icon_large, self._app_icon)
         except tk.TclError:
-            self._app_icon = None
+            if self._app_icon is not None:
+                try:
+                    self.iconphoto(True, self._app_icon)
+                except tk.TclError:
+                    pass
 
     def update_editor_style(self, _event=None):
         font_family = self.font_var.get() or "Arial"
@@ -471,14 +508,16 @@ class PdfParagraphEditor(tk.Tk):
             raw = json.loads(self.recent_store_path().read_text(encoding="utf-8"))
             if not isinstance(raw, list):
                 return []
-            return [path for path in raw if isinstance(path, str) and os.path.isfile(path)][:5]
+            limit = self.settings.max_recent_files if hasattr(self, "settings") else 5
+            return [path for path in raw if isinstance(path, str) and os.path.isfile(path)][:limit]
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return []
 
     def save_recent_files(self):
         try:
+            limit = self.settings.max_recent_files if hasattr(self, "settings") else 5
             self.recent_store_path().write_text(
-                json.dumps(self.recent_files[:5], ensure_ascii=False, indent=2),
+                json.dumps(self.recent_files[:limit], ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except OSError:
@@ -488,7 +527,7 @@ class PdfParagraphEditor(tk.Tk):
         if path in self.recent_files:
             self.recent_files.remove(path)
         self.recent_files.insert(0, path)
-        self.recent_files = self.recent_files[:5]
+        self.recent_files = self.recent_files[: self.settings.max_recent_files]
         self.save_recent_files()
         self.refresh_recent_ui()
 
@@ -601,6 +640,9 @@ class PdfParagraphEditor(tk.Tk):
         self.find_matches = []
         self.find_index = -1
         self.find_query = ""
+        self.history.clear()
+        self._drag_history_snapshot = None
+        self._nudge_undo_open = False
         self.destroy_inplace_editor(commit=False)
         if self.find_visible:
             self.hide_find_bar()
@@ -1115,6 +1157,10 @@ class PdfParagraphEditor(tk.Tk):
             self.metrics_label.config(text="Chọn một đoạn trên PDF để xem thông số gốc.")
         self.current_page_index = max(0, min(focus_page, len(self.doc) - 1))
         self.structure_dirty = True
+        # Page structure changes rebuild blocks from PDF — reset edit history.
+        self.history.clear()
+        self._drag_history_snapshot = None
+        self._nudge_undo_open = False
         self.refresh_page_thumbnails()
         self.refresh_outlines()
         self.refresh_tool_button_states()
@@ -1368,8 +1414,8 @@ class PdfParagraphEditor(tk.Tk):
         self.tool_button(
             topbar, "text", self.enable_insert_mode, width=38, tooltip="Chế độ chèn text (T)", tool_name="insert"
         )
-        self.tool_button(topbar, "minus", lambda: self.change_zoom(-0.15), width=38, tooltip="Thu nhỏ / Zoom out (Ctrl+-)")
-        self.tool_button(topbar, "plus", lambda: self.change_zoom(0.15), width=38, tooltip="Phóng to / Zoom in (Ctrl++)")
+        self.tool_button(topbar, "minus", self.zoom_out, width=38, tooltip="Thu nhỏ / Zoom out (Ctrl+-)")
+        self.tool_button(topbar, "plus", self.zoom_in, width=38, tooltip="Phóng to / Zoom in (Ctrl++)")
         self.tool_button(topbar, "pen", self.apply_text_change, tooltip="Áp dụng sửa (Ctrl+Enter)")
         self.tool_button(topbar, "crop", self.fit_page_to_window, tooltip="Vừa khung xem")
         self.tool_button(topbar, "undo", self.restore_selected_block, width=38, tooltip="Khôi phục đoạn về bản gốc")
@@ -1379,14 +1425,14 @@ class PdfParagraphEditor(tk.Tk):
         self.file_label = tk.Label(topbar, text="Chưa mở PDF", bg=self.colors["top"], fg=self.colors["muted"], padx=10)
         self.file_label.pack(side=tk.LEFT, pady=2)
 
-        self.find_bar = tk.Frame(self, bg="#1c1c1c", height=36)
-        self.find_bar.pack_propagate(False)
-        find_inner = tk.Frame(self.find_bar, bg="#1c1c1c")
-        find_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-        tk.Label(find_inner, text="Tìm:", bg="#1c1c1c", fg=self.colors["muted"]).pack(side=tk.LEFT)
+        self.find_bar = tk.Frame(self, bg="#1c1c1c")
+        # Two rows: Find + Replace
+        find_row = tk.Frame(self.find_bar, bg="#1c1c1c")
+        find_row.pack(fill=tk.X, padx=10, pady=(6, 2))
+        tk.Label(find_row, text="Tìm:", bg="#1c1c1c", fg=self.colors["muted"], width=8, anchor=tk.W).pack(side=tk.LEFT)
         self.find_var = tk.StringVar()
         self.find_entry = tk.Entry(
-            find_inner,
+            find_row,
             textvariable=self.find_var,
             bg="#121212",
             fg=self.colors["text"],
@@ -1395,18 +1441,49 @@ class PdfParagraphEditor(tk.Tk):
             highlightthickness=1,
             highlightbackground="#3a3a3a",
             highlightcolor=self.colors["accent"],
-            width=36,
+            width=28,
         )
-        self.find_entry.pack(side=tk.LEFT, padx=(8, 6), ipady=3)
+        self.find_entry.pack(side=tk.LEFT, padx=(4, 6), ipady=3)
         self.find_entry.bind("<Return>", lambda _e: self.find_next())
         self.find_entry.bind("<Shift-Return>", lambda _e: self.find_prev())
         self.find_entry.bind("<Escape>", lambda _e: self.hide_find_bar())
         self.find_var.trace_add("write", lambda *_args: self.on_find_query_changed())
-        self.panel_button(find_inner, "↑", self.find_prev).pack(side=tk.LEFT, padx=(0, 4))
-        self.panel_button(find_inner, "↓", self.find_next).pack(side=tk.LEFT, padx=(0, 8))
-        self.find_status = tk.Label(find_inner, text="", bg="#1c1c1c", fg=self.colors["muted"])
+        self.panel_button(find_row, "↑", self.find_prev).pack(side=tk.LEFT, padx=(0, 4))
+        self.panel_button(find_row, "↓", self.find_next).pack(side=tk.LEFT, padx=(0, 8))
+        self.find_status = tk.Label(find_row, text="", bg="#1c1c1c", fg=self.colors["muted"])
         self.find_status.pack(side=tk.LEFT, padx=(0, 10))
-        self.panel_button(find_inner, "Đóng", self.hide_find_bar).pack(side=tk.RIGHT)
+        self.panel_button(find_row, "Đóng", self.hide_find_bar).pack(side=tk.RIGHT)
+
+        replace_row = tk.Frame(self.find_bar, bg="#1c1c1c")
+        replace_row.pack(fill=tk.X, padx=10, pady=(2, 6))
+        tk.Label(replace_row, text="Thay bằng:", bg="#1c1c1c", fg=self.colors["muted"], width=8, anchor=tk.W).pack(
+            side=tk.LEFT
+        )
+        self.replace_var = tk.StringVar()
+        self.replace_entry = tk.Entry(
+            replace_row,
+            textvariable=self.replace_var,
+            bg="#121212",
+            fg=self.colors["text"],
+            insertbackground="#ffffff",
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground="#3a3a3a",
+            highlightcolor=self.colors["accent"],
+            width=28,
+        )
+        self.replace_entry.pack(side=tk.LEFT, padx=(4, 6), ipady=3)
+        self.replace_entry.bind("<Return>", lambda _e: self.replace_current_match())
+        self.replace_entry.bind("<Escape>", lambda _e: self.hide_find_bar())
+        self.panel_button(replace_row, "Thay thế", self.replace_current_match).pack(side=tk.LEFT, padx=(0, 4))
+        self.panel_button(replace_row, "Thay tất cả", self.replace_all_matches, accent=True).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(
+            replace_row,
+            text="Ctrl+H mở · không phân biệt hoa/thường",
+            bg="#1c1c1c",
+            fg="#666666",
+            font=("Segoe UI", 8),
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         self.body = tk.Frame(self, bg=self.colors["bg"])
         self.body.pack(fill=tk.BOTH, expand=True)
@@ -1444,8 +1521,8 @@ class PdfParagraphEditor(tk.Tk):
         self.canvas.bind("<Button-5>", self.on_viewer_button5)
         self.canvas.bind("<Shift-Button-4>", lambda event: self._viewer_scroll_x(-1))
         self.canvas.bind("<Shift-Button-5>", lambda event: self._viewer_scroll_x(1))
-        self.canvas.bind("<Control-Button-4>", lambda event: self.zoom_at_event(event, 0.15))
-        self.canvas.bind("<Control-Button-5>", lambda event: self.zoom_at_event(event, -0.15))
+        self.canvas.bind("<Control-Button-4>", lambda event: self.zoom_at_event(event, float(self.settings.zoom_step)))
+        self.canvas.bind("<Control-Button-5>", lambda event: self.zoom_at_event(event, -float(self.settings.zoom_step)))
         self.canvas.bind("<Configure>", self.on_viewer_canvas_configure)
         # Windows often sends wheel events only to the focused widget.
         self.canvas.bind("<Enter>", self._on_viewer_enter_for_scroll)
@@ -1653,12 +1730,14 @@ class PdfParagraphEditor(tk.Tk):
         file_menu.add_command(label="Lưu PDF mới…", command=self.save_pdf, accelerator="Ctrl+S")
         file_menu.add_command(label="In…", command=self.print_pdf, accelerator="Ctrl+P")
         file_menu.add_separator()
+        file_menu.add_command(label="Cài đặt…", command=self.show_settings_dialog, accelerator="Ctrl+,")
+        file_menu.add_separator()
         file_menu.add_command(label="Thoát", command=self.on_app_close)
         menubar.add_cascade(label="Tệp", menu=file_menu)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
-        edit_menu.add_command(label="Hoàn tác (ô soạn)", command=self.undo_action, accelerator="Ctrl+Z")
-        edit_menu.add_command(label="Làm lại (ô soạn)", command=self.redo_action, accelerator="Ctrl+Y")
+        edit_menu.add_command(label="Hoàn tác", command=self.undo_action, accelerator="Ctrl+Z")
+        edit_menu.add_command(label="Làm lại", command=self.redo_action, accelerator="Ctrl+Y")
         edit_menu.add_separator()
         edit_menu.add_command(label="Sửa tại chỗ", command=self.start_inplace_edit_selected, accelerator="F2")
         edit_menu.add_command(label="Áp dụng sửa", command=self.apply_text_change, accelerator="Ctrl+Enter")
@@ -1667,14 +1746,17 @@ class PdfParagraphEditor(tk.Tk):
         edit_menu.add_command(label="Bỏ chọn", command=self.clear_selection, accelerator="Esc")
         edit_menu.add_separator()
         edit_menu.add_command(label="Tìm…", command=self.show_find_bar, accelerator="Ctrl+F")
+        edit_menu.add_command(label="Tìm & thay thế…", command=self.show_find_replace_bar, accelerator="Ctrl+H")
+        edit_menu.add_command(label="Thay thế", command=self.replace_current_match)
+        edit_menu.add_command(label="Thay tất cả", command=self.replace_all_matches)
         menubar.add_cascade(label="Sửa", menu=edit_menu)
 
         view_menu = tk.Menu(menubar, tearoff=0)
         view_menu.add_command(label="Trang trước", command=self.previous_page, accelerator="←")
         view_menu.add_command(label="Trang sau", command=self.next_page, accelerator="→")
         view_menu.add_separator()
-        view_menu.add_command(label="Phóng to", command=lambda: self.change_zoom(0.15), accelerator="Ctrl++")
-        view_menu.add_command(label="Thu nhỏ", command=lambda: self.change_zoom(-0.15), accelerator="Ctrl+-")
+        view_menu.add_command(label="Phóng to", command=self.zoom_in, accelerator="Ctrl++")
+        view_menu.add_command(label="Thu nhỏ", command=self.zoom_out, accelerator="Ctrl+-")
         view_menu.add_command(label="Zoom 100%", command=lambda: self.set_zoom(1.0), accelerator="Ctrl+1")
         view_menu.add_command(label="Vừa trang", command=self.fit_page_to_window, accelerator="Ctrl+0")
         view_menu.add_separator()
@@ -1763,6 +1845,8 @@ class PdfParagraphEditor(tk.Tk):
         self.bind_all("<Control-S>", lambda event: self._shortcut(self.save_pdf))
         self.bind_all("<Control-f>", lambda event: self._shortcut(self.show_find_bar))
         self.bind_all("<Control-F>", lambda event: self._shortcut(self.show_find_bar))
+        self.bind_all("<Control-h>", lambda event: self._shortcut(self.show_find_replace_bar))
+        self.bind_all("<Control-H>", lambda event: self._shortcut(self.show_find_replace_bar))
         self.bind_all("<Control-p>", lambda event: self._shortcut(self.print_pdf))
         self.bind_all("<Control-P>", lambda event: self._shortcut(self.print_pdf))
         self.bind_all("<Control-z>", self.undo_action)
@@ -1770,11 +1854,12 @@ class PdfParagraphEditor(tk.Tk):
         self.bind_all("<Control-y>", self.redo_action)
         self.bind_all("<Control-Y>", self.redo_action)
         self.bind_all("<Control-Return>", lambda event: self._shortcut(self.apply_text_change))
-        self.bind_all("<Control-plus>", lambda event: self._shortcut(lambda: self.change_zoom(0.15)))
-        self.bind_all("<Control-equal>", lambda event: self._shortcut(lambda: self.change_zoom(0.15)))
-        self.bind_all("<Control-minus>", lambda event: self._shortcut(lambda: self.change_zoom(-0.15)))
+        self.bind_all("<Control-plus>", lambda event: self._shortcut(self.zoom_in))
+        self.bind_all("<Control-equal>", lambda event: self._shortcut(self.zoom_in))
+        self.bind_all("<Control-minus>", lambda event: self._shortcut(self.zoom_out))
         self.bind_all("<Control-0>", lambda event: self._shortcut(self.fit_page_to_window))
         self.bind_all("<Control-1>", lambda event: self._shortcut(lambda: self.set_zoom(1.0)))
+        self.bind_all("<Control-comma>", lambda event: self._shortcut(self.show_settings_dialog))
         self.bind_all("<F2>", lambda event: self._shortcut(self.start_inplace_edit_selected))
         self.bind_all("<Escape>", self.on_escape)
         self.bind_all("<Delete>", self.on_delete_key)
@@ -1796,7 +1881,12 @@ class PdfParagraphEditor(tk.Tk):
         widget = self.focus_get()
         if widget is None:
             return False
-        if widget in {self.editor, getattr(self, "find_entry", None), self.inplace_text}:
+        if widget in {
+            self.editor,
+            getattr(self, "find_entry", None),
+            getattr(self, "replace_entry", None),
+            self.inplace_text,
+        }:
             return True
         class_name = widget.winfo_class()
         return class_name in {"Entry", "TEntry", "Text", "TCombobox", "TSpinbox", "Spinbox"}
@@ -1854,17 +1944,17 @@ class PdfParagraphEditor(tk.Tk):
         return None
 
     def _nudge_step_from_event(self, event) -> float:
-        """Arrow nudge distance in PDF points."""
+        """Arrow nudge distance in PDF points (from settings)."""
         state = int(getattr(event, "state", 0) or 0)
         shift = bool(state & 0x0001)
         control = bool(state & 0x0004)
         if control and shift:
-            return 20.0
+            return float(self.settings.nudge_step_shift) * 2.0
         if shift:
-            return 10.0
+            return float(self.settings.nudge_step_shift)
         if control:
-            return 0.5
-        return 1.0
+            return float(self.settings.nudge_step_ctrl)
+        return float(self.settings.nudge_step)
 
     def nudge_selected_block(self, dx: float, dy: float):
         if self.selected_block_id is None or self.doc is None:
@@ -1876,6 +1966,17 @@ class PdfParagraphEditor(tk.Tk):
             return
         if block.page_index != self.current_page_index:
             self.goto_page(block.page_index)
+
+        # Coalesce held-key nudges into a single undo step.
+        if not self._nudge_undo_open:
+            self.record_history("Di chuyển box (phím)")
+            self._nudge_undo_open = True
+        if self._nudge_history_close_job is not None:
+            try:
+                self.after_cancel(self._nudge_history_close_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._nudge_history_close_job = self.after(450, self._close_nudge_history_session)
 
         base = copy.copy(block.rect)
         moved = fitz.Rect(base.x0 + dx, base.y0 + dy, base.x1 + dx, base.y1 + dy)
@@ -1902,6 +2003,10 @@ class PdfParagraphEditor(tk.Tk):
                 pass
         self._nudge_render_job = self.after(120, self._render_after_nudge)
 
+    def _close_nudge_history_session(self):
+        self._nudge_history_close_job = None
+        self._nudge_undo_open = False
+
     def _render_after_nudge(self):
         self._nudge_render_job = None
         if self.doc is None:
@@ -1926,25 +2031,97 @@ class PdfParagraphEditor(tk.Tk):
             return "break"
         return None
 
+    def capture_history_snapshot(self) -> HistorySnapshot:
+        return HistorySnapshot(
+            blocks=clone_blocks(self.blocks),
+            selected_block_id=self.selected_block_id,
+            current_page_index=self.current_page_index,
+            insert_mode=self.insert_mode,
+        )
+
+    def record_history(self, label: str):
+        """Push current document state before a mutating edit."""
+        if self.doc is None:
+            return
+        self.history.push(label, self.capture_history_snapshot())
+        self._update_history_status()
+
+    def restore_history_snapshot(self, snapshot: HistorySnapshot):
+        """Apply a snapshot and refresh the UI."""
+        self.destroy_inplace_editor(commit=False)
+        self.blocks = clone_blocks(snapshot.blocks)
+        self.selected_block_id = snapshot.selected_block_id
+        self.insert_mode = snapshot.insert_mode
+        self.resize_state = None
+        self.move_state = None
+        self._drag_history_snapshot = None
+        self._nudge_undo_open = False
+        page = snapshot.current_page_index
+        if self.doc is not None and len(self.doc) > 0:
+            page = max(0, min(page, len(self.doc) - 1))
+        self.current_page_index = page
+        self.refresh_tool_button_states()
+        self.render_current_page()
+        if self.selected_block_id is not None and self.get_block(self.selected_block_id) is not None:
+            self.select_block(self.selected_block_id)
+        else:
+            self.selected_block_id = None
+            self.editor.delete("1.0", tk.END)
+            self.block_info.config(text="Chưa chọn đoạn")
+            if hasattr(self, "metrics_label"):
+                self.metrics_label.config(text="Chọn một đoạn trên PDF để xem thông số gốc.")
+        self._update_history_status()
+
+    def _update_history_status(self):
+        # Optional subtle status when undo stack changes; keep non-intrusive.
+        pass
+
     def undo_action(self, _event=None):
         widget = self.focus_get()
-        if widget == getattr(self, "find_entry", None):
+        if widget in {getattr(self, "find_entry", None), getattr(self, "replace_entry", None)}:
             return None
-        if widget == self.editor:
+
+        # Prefer document history; fall back to Text widget undo while typing.
+        if self.history.can_undo():
+            label = self.history.undo_label() or "thao tác"
+            current = self.capture_history_snapshot()
+            snap = self.history.undo(current)
+            if snap is not None:
+                self.restore_history_snapshot(snap)
+                self.update_status_bar(f"Hoàn tác: {label}")
+            return "break"
+
+        if widget == self.editor or widget == self.inplace_text:
+            target = widget
             try:
-                self.editor.edit_undo()
+                target.edit_undo()
             except tk.TclError:
                 pass
             return "break"
-        if self.selected_block_id is not None:
-            self.restore_selected_block()
+        self.update_status_bar("Không còn thao tác để hoàn tác")
         return "break"
 
     def redo_action(self, _event=None):
-        try:
-            self.editor.edit_redo()
-        except tk.TclError:
-            pass
+        widget = self.focus_get()
+        if widget in {getattr(self, "find_entry", None), getattr(self, "replace_entry", None)}:
+            return None
+
+        if self.history.can_redo():
+            label = self.history.redo_label() or "thao tác"
+            current = self.capture_history_snapshot()
+            snap = self.history.redo(current)
+            if snap is not None:
+                self.restore_history_snapshot(snap)
+                self.update_status_bar(f"Làm lại: {label}")
+            return "break"
+
+        if widget == self.editor or widget == self.inplace_text:
+            try:
+                widget.edit_redo()
+            except tk.TclError:
+                pass
+            return "break"
+        self.update_status_bar("Không còn thao tác để làm lại")
         return "break"
 
     def show_shortcuts_help(self):
@@ -1953,14 +2130,16 @@ class PdfParagraphEditor(tk.Tk):
             "Ctrl+O  Mở PDF\n"
             "Ctrl+S  Lưu PDF mới\n"
             "Ctrl+F  Tìm text\n"
+            "Ctrl+H  Tìm & thay thế\n"
             "Ctrl+P  In\n"
             "F2 / Double-click  Sửa text trực tiếp trên box\n"
             "Ctrl+Enter  Áp dụng sửa (giữ format gốc)\n"
-            "Ctrl+Z / Ctrl+Y  Hoàn tác / Làm lại (ô soạn)\n"
+            "Ctrl+Z / Ctrl+Y  Hoàn tác / Làm lại (toàn tài liệu)\n"
             "Ctrl++ / Ctrl+-  Zoom\n"
             "Con lăn  Cuộn dọc preview · Shift+con lăn cuộn ngang · Ctrl+con lăn zoom\n"
             "Ctrl+0  Vừa trang\n"
             "Ctrl+1  Zoom 100%\n"
+            "Ctrl+,  Cài đặt\n"
             "V  Chế độ chọn\n"
             "T  Chế độ chèn text\n"
             "←↑↓→  Di chuyển box đã chọn (Shift=10pt, Ctrl=0.5pt)\n"
@@ -1982,6 +2161,226 @@ class PdfParagraphEditor(tk.Tk):
             "Nhà phát triển: donpv\n"
             "Repo: donkma93/pdftool",
         )
+
+    def apply_settings_to_runtime(self, persist: bool = True):
+        """Apply current self.settings to live app state."""
+        self.settings.clamp()
+        self.page_margin = int(self.settings.page_margin)
+        self.history.max_steps = int(self.settings.history_max_steps)
+        # Trim undo stacks if max shrunk
+        while len(self.history._undo) > self.history.max_steps:
+            self.history._undo.pop(0)
+        if hasattr(self, "font_var"):
+            preferred = self.settings.default_font
+            if preferred in self.font_files:
+                self.font_var.set(preferred)
+            elif self.font_files:
+                self.font_var.set(next(iter(self.font_files)))
+        self.pdf_font_path = (
+            self.font_files.get(self.settings.default_font)
+            or self.font_files.get("Arial")
+            or find_unicode_font(self.font_files)
+        )
+        self.recent_files = self.recent_files[: self.settings.max_recent_files]
+        if persist:
+            save_settings(self.settings)
+            self.save_recent_files()
+            self.refresh_recent_ui()
+            self.update_status_bar("Đã áp dụng cài đặt")
+
+    def _silent_check_updates_on_start(self):
+        try:
+            latest_tag = latest_github_tag()
+        except Exception:
+            return
+        if latest_tag and is_newer_version(latest_tag, APP_VERSION):
+            should_open = messagebox.askyesno(
+                "Có bản cập nhật mới",
+                f"Phát hiện bản mới {latest_tag} (hiện tại v{APP_VERSION}).\n\nMở trang tải / cập nhật?",
+            )
+            if should_open:
+                self.check_for_updates()
+
+    def show_settings_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Cài đặt — PDFTOOL")
+        dialog.configure(bg=self.colors["panel"])
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("+%d+%d" % (self.winfo_rootx() + 120, self.winfo_rooty() + 80))
+
+        pad = {"padx": 14, "pady": 6}
+        body = tk.Frame(dialog, bg=self.colors["panel"])
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        tk.Label(
+            body,
+            text="Tùy chọn được lưu tại %APPDATA%\\PDFTOOL\\settings.json",
+            bg=self.colors["panel"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 8),
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+
+        def row_label(r, text):
+            tk.Label(body, text=text, bg=self.colors["panel"], fg=self.colors["text"], anchor=tk.W).grid(
+                row=r, column=0, sticky=tk.W, **pad
+            )
+
+        # --- values ---
+        zoom_var = tk.DoubleVar(value=self.settings.default_zoom)
+        zoom_step_var = tk.DoubleVar(value=self.settings.zoom_step)
+        nudge_var = tk.DoubleVar(value=self.settings.nudge_step)
+        nudge_shift_var = tk.DoubleVar(value=self.settings.nudge_step_shift)
+        nudge_ctrl_var = tk.DoubleVar(value=self.settings.nudge_step_ctrl)
+        margin_var = tk.IntVar(value=self.settings.page_margin)
+        recent_var = tk.IntVar(value=self.settings.max_recent_files)
+        history_var = tk.IntVar(value=self.settings.history_max_steps)
+        fit_var = tk.BooleanVar(value=self.settings.fit_on_open)
+        confirm_var = tk.BooleanVar(value=self.settings.confirm_replace_all)
+        update_var = tk.BooleanVar(value=self.settings.check_updates_on_start)
+        font_choices = list(self.font_files.keys()) or ["Arial"]
+        font_default = self.settings.default_font if self.settings.default_font in font_choices else font_choices[0]
+        font_var = tk.StringVar(value=font_default)
+
+        def spin(parent, var, from_, to, increment=0.05, width=8):
+            return ttk.Spinbox(
+                parent,
+                from_=from_,
+                to=to,
+                increment=increment,
+                textvariable=var,
+                width=width,
+                style="Dark.TSpinbox",
+            )
+
+        r = 1
+        row_label(r, "Zoom mặc định khi mở PDF")
+        spin(body, zoom_var, 0.5, 3.0, 0.05).grid(row=r, column=1, sticky=tk.W, **pad)
+        tk.Label(body, text="(0.5 – 3.0)", bg=self.colors["panel"], fg=self.colors["muted"]).grid(
+            row=r, column=2, sticky=tk.W
+        )
+        r += 1
+        row_label(r, "Bước zoom (+/− / Ctrl+lăn)")
+        spin(body, zoom_step_var, 0.05, 1.0, 0.05).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Vừa trang khi mở PDF")
+        tk.Checkbutton(
+            body,
+            variable=fit_var,
+            text="Bật fit page khi mở",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            selectcolor="#111111",
+            activebackground=self.colors["panel"],
+            activeforeground=self.colors["text"],
+        ).grid(row=r, column=1, columnspan=2, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Bước mũi tên di chuyển box (pt)")
+        spin(body, nudge_var, 0.1, 50.0, 0.5).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Bước Shift+mũi tên (pt)")
+        spin(body, nudge_shift_var, 1.0, 100.0, 1.0).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Bước Ctrl+mũi tên (pt)")
+        spin(body, nudge_ctrl_var, 0.1, 10.0, 0.1).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Lề preview (px)")
+        spin(body, margin_var, 8, 80, 1, width=8).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Font mặc định (chèn text)")
+        ttk.Combobox(
+            body,
+            textvariable=font_var,
+            values=font_choices,
+            state="readonly",
+            width=18,
+            style="Dark.TCombobox",
+        ).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Số file gần đây")
+        spin(body, recent_var, 1, 20, 1, width=8).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Số bước Undo tối đa")
+        spin(body, history_var, 5, 200, 1, width=8).grid(row=r, column=1, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Xác nhận khi Thay tất cả")
+        tk.Checkbutton(
+            body,
+            variable=confirm_var,
+            text="Hỏi trước khi thay tất cả",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            selectcolor="#111111",
+            activebackground=self.colors["panel"],
+            activeforeground=self.colors["text"],
+        ).grid(row=r, column=1, columnspan=2, sticky=tk.W, **pad)
+        r += 1
+        row_label(r, "Kiểm tra cập nhật khi mở app")
+        tk.Checkbutton(
+            body,
+            variable=update_var,
+            text="Tự kiểm tra bản mới khi khởi động",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            selectcolor="#111111",
+            activebackground=self.colors["panel"],
+            activeforeground=self.colors["text"],
+        ).grid(row=r, column=1, columnspan=2, sticky=tk.W, **pad)
+
+        buttons = tk.Frame(dialog, bg=self.colors["panel"])
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def read_values() -> AppSettings | None:
+            try:
+                return AppSettings(
+                    default_zoom=float(zoom_var.get()),
+                    zoom_step=float(zoom_step_var.get()),
+                    nudge_step=float(nudge_var.get()),
+                    nudge_step_shift=float(nudge_shift_var.get()),
+                    nudge_step_ctrl=float(nudge_ctrl_var.get()),
+                    fit_on_open=bool(fit_var.get()),
+                    default_font=font_var.get() or "Arial",
+                    max_recent_files=int(recent_var.get()),
+                    history_max_steps=int(history_var.get()),
+                    confirm_replace_all=bool(confirm_var.get()),
+                    page_margin=int(margin_var.get()),
+                    check_updates_on_start=bool(update_var.get()),
+                ).clamp()
+            except (tk.TclError, ValueError, TypeError):
+                messagebox.showerror("Giá trị không hợp lệ", "Hãy kiểm tra lại các số trong form cài đặt.", parent=dialog)
+                return None
+
+        def on_save():
+            settings = read_values()
+            if settings is None:
+                return
+            self.settings = settings
+            self.apply_settings_to_runtime(persist=True)
+            dialog.destroy()
+
+        def on_reset():
+            defaults = AppSettings().clamp()
+            zoom_var.set(defaults.default_zoom)
+            zoom_step_var.set(defaults.zoom_step)
+            nudge_var.set(defaults.nudge_step)
+            nudge_shift_var.set(defaults.nudge_step_shift)
+            nudge_ctrl_var.set(defaults.nudge_step_ctrl)
+            margin_var.set(defaults.page_margin)
+            recent_var.set(defaults.max_recent_files)
+            history_var.set(defaults.history_max_steps)
+            fit_var.set(defaults.fit_on_open)
+            confirm_var.set(defaults.confirm_replace_all)
+            update_var.set(defaults.check_updates_on_start)
+            font_var.set(defaults.default_font if defaults.default_font in font_choices else font_choices[0])
+
+        self.panel_button(buttons, "Đặt lại mặc định", on_reset).pack(side=tk.LEFT)
+        self.panel_button(buttons, "Hủy", dialog.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        self.panel_button(buttons, "Lưu", on_save, accent=True).pack(side=tk.RIGHT)
+
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        dialog.bind("<Return>", lambda _e: on_save())
+        dialog.wait_window()
 
     def on_app_close(self):
         if self.doc is not None and not self.confirm_discard_unsaved_changes():
@@ -2047,6 +2446,13 @@ class PdfParagraphEditor(tk.Tk):
             self.rebuild_find_matches()
             self.find_next()
 
+    def show_find_replace_bar(self):
+        """Open find bar and focus the replace field."""
+        self.show_find_bar()
+        if self.find_visible and hasattr(self, "replace_entry"):
+            self.replace_entry.focus_set()
+            self.replace_entry.selection_range(0, tk.END)
+
     def hide_find_bar(self):
         if not self.find_visible:
             return
@@ -2074,17 +2480,27 @@ class PdfParagraphEditor(tk.Tk):
         self.draw_find_highlights()
 
     def rebuild_find_matches(self):
-        query = self.find_var.get().strip()
+        query = self.find_var.get()
+        # Keep raw query for display; matching strips only pure whitespace-only.
         self.find_query = query
         self.find_matches = []
         self.find_index = -1
         if not query or self.doc is None:
             return
-        folded = query.casefold()
         for block in self.blocks:
-            text = block.original_text if block.deleted else block.text
-            if folded in text.casefold():
-                self.find_matches.append((block.page_index, block.id))
+            if block.deleted:
+                continue
+            for start, end in self._iter_match_spans(block.text, query):
+                self.find_matches.append((block.page_index, block.id, start, end))
+
+    def _iter_match_spans(self, text: str, query: str) -> list[tuple[int, int]]:
+        if not query or not text:
+            return []
+        try:
+            pattern = re.compile(re.escape(query), flags=re.IGNORECASE)
+        except re.error:
+            return []
+        return [(match.start(), match.end()) for match in pattern.finditer(text)]
 
     def find_next(self):
         self._navigate_find(1)
@@ -2097,7 +2513,7 @@ class PdfParagraphEditor(tk.Tk):
             return
         if not self.find_visible:
             self.show_find_bar()
-        query = self.find_var.get().strip()
+        query = self.find_var.get()
         if not query:
             self.find_status.config(text="Nhập nội dung cần tìm")
             return
@@ -2111,16 +2527,152 @@ class PdfParagraphEditor(tk.Tk):
             self.find_index = 0 if direction >= 0 else len(self.find_matches) - 1
         else:
             self.find_index = (self.find_index + direction) % len(self.find_matches)
-        page_index, block_id = self.find_matches[self.find_index]
+        self._focus_find_match(self.find_index)
+
+    def _focus_find_match(self, index: int):
+        if index < 0 or index >= len(self.find_matches):
+            return
+        page_index, block_id, start, end = self.find_matches[index]
+        self.find_index = index
         self.current_page_index = page_index
         self.selected_block_id = None
         self.insert_mode = False
         self.refresh_tool_button_states()
         self.render_current_page()
         self.select_block(block_id)
+        self._select_editor_range(start, end)
         self.draw_find_highlights()
-        self.find_status.config(text=f"{self.find_index + 1}/{len(self.find_matches)}")
-        self.update_status_bar(f"Kết quả tìm {self.find_index + 1}/{len(self.find_matches)}")
+        self.find_status.config(text=f"{index + 1}/{len(self.find_matches)}")
+        self.update_status_bar(f"Kết quả tìm {index + 1}/{len(self.find_matches)}")
+
+    def _select_editor_range(self, start: int, end: int):
+        if not hasattr(self, "editor"):
+            return
+        text_len = len(self.editor.get("1.0", "end-1c"))
+        start = max(0, min(start, text_len))
+        end = max(start, min(end, text_len))
+        try:
+            self.editor.tag_remove(tk.SEL, "1.0", tk.END)
+            self.editor.tag_add(tk.SEL, f"1.0+{start}c", f"1.0+{end}c")
+            self.editor.mark_set(tk.INSERT, f"1.0+{end}c")
+            self.editor.see(f"1.0+{start}c")
+        except tk.TclError:
+            pass
+
+    def replace_current_match(self):
+        if self.doc is None:
+            messagebox.showinfo("Chưa có PDF", "Hãy mở một file PDF trước.")
+            return
+        if not self.find_visible:
+            self.show_find_replace_bar()
+        query = self.find_var.get()
+        if not query:
+            self.find_status.config(text="Nhập nội dung cần tìm")
+            return
+        if query != self.find_query or not self.find_matches:
+            self.rebuild_find_matches()
+        if not self.find_matches:
+            self.find_status.config(text="Không tìm thấy")
+            self.draw_find_highlights()
+            return
+        if self.find_index < 0 or self.find_index >= len(self.find_matches):
+            self.find_index = 0
+            self._focus_find_match(0)
+            return
+
+        page_index, block_id, start, end = self.find_matches[self.find_index]
+        block = self.get_block(block_id)
+        if block is None or block.deleted:
+            self.rebuild_find_matches()
+            self.find_status.config(text="Khớp không còn hợp lệ")
+            return
+
+        replacement = self.replace_var.get()
+        # Re-validate span against current text (may have drifted)
+        if end > len(block.text) or start < 0 or start >= end:
+            self.rebuild_find_matches()
+            if self.find_matches:
+                self._focus_find_match(min(self.find_index, len(self.find_matches) - 1))
+            return
+
+        self.record_history("Thay thế")
+        block.text = block.text[:start] + replacement + block.text[end:]
+        block.deleted = False
+        block.style_spans = self.style_spans_for_plain_text(block, block.text)
+
+        # Rebuild matches and stay on a sensible next hit.
+        old_index = self.find_index
+        self.rebuild_find_matches()
+        self.render_current_page()
+        if self.find_matches:
+            next_index = min(old_index, len(self.find_matches) - 1)
+            self._focus_find_match(next_index)
+            self.find_status.config(text=f"Đã thay · {next_index + 1}/{len(self.find_matches)}")
+            self.update_status_bar("Đã thay thế 1 chỗ")
+        else:
+            self.find_index = -1
+            self.select_block(block_id)
+            self.find_status.config(text="Đã thay · hết kết quả")
+            self.update_status_bar("Đã thay thế 1 chỗ — không còn khớp")
+            self.draw_find_highlights()
+
+    def replace_all_matches(self, *, confirm: bool = True):
+        if self.doc is None:
+            messagebox.showinfo("Chưa có PDF", "Hãy mở một file PDF trước.")
+            return
+        if not self.find_visible:
+            self.show_find_replace_bar()
+        query = self.find_var.get()
+        if not query:
+            self.find_status.config(text="Nhập nội dung cần tìm")
+            return
+
+        self.rebuild_find_matches()
+        total = len(self.find_matches)
+        if total == 0:
+            self.find_status.config(text="Không tìm thấy")
+            self.draw_find_highlights()
+            return
+
+        replacement = self.replace_var.get()
+        if confirm and self.settings.confirm_replace_all and not messagebox.askyesno(
+            "Thay tất cả",
+            f"Thay tất cả {total} chỗ khớp với:\n“{query}”\n→ “{replacement}”\n\n"
+            "Không phân biệt chữ hoa/thường. Tiếp tục?",
+        ):
+            return
+
+        self.record_history(f"Thay tất cả ({total})")
+        # Replace per block from the end so offsets stay valid within each block.
+        by_block: dict[int, list[tuple[int, int]]] = {}
+        for _page, block_id, start, end in self.find_matches:
+            by_block.setdefault(block_id, []).append((start, end))
+
+        replaced = 0
+        for block_id, spans in by_block.items():
+            block = self.get_block(block_id)
+            if block is None or block.deleted:
+                continue
+            text = block.text
+            for start, end in sorted(spans, key=lambda item: item[0], reverse=True):
+                if end > len(text) or start < 0 or start >= end:
+                    continue
+                text = text[:start] + replacement + text[end:]
+                replaced += 1
+            block.text = text
+            block.deleted = False
+            block.style_spans = self.style_spans_for_plain_text(block, block.text)
+
+        self.rebuild_find_matches()
+        self.render_current_page()
+        self.find_index = -1
+        self.find_status.config(text=f"Đã thay {replaced} chỗ")
+        self.update_status_bar(f"Đã thay tất cả: {replaced} chỗ")
+        self.draw_find_highlights()
+        if self.selected_block_id is not None:
+            block = self.get_block(self.selected_block_id)
+            if block is not None:
+                self.select_block(block.id)
 
     def draw_find_highlights(self):
         if not hasattr(self, "canvas"):
@@ -2128,14 +2680,20 @@ class PdfParagraphEditor(tk.Tk):
         self.canvas.delete("find_highlight")
         if not self.find_matches:
             return
-        for index, (page_index, block_id) in enumerate(self.find_matches):
-            if page_index != self.current_page_index:
+        # Highlight unique blocks on the current page; emphasize current match's block.
+        current_block_id = None
+        if 0 <= self.find_index < len(self.find_matches):
+            current_block_id = self.find_matches[self.find_index][1]
+        seen: set[int] = set()
+        for index, (page_index, block_id, _start, _end) in enumerate(self.find_matches):
+            if page_index != self.current_page_index or block_id in seen:
                 continue
+            seen.add(block_id)
             block = self.get_block(block_id)
             if block is None:
                 continue
             rect = self.pdf_rect_to_canvas(self.expanded_text_rect(block))
-            is_current = index == self.find_index
+            is_current = block_id == current_block_id
             self.canvas.create_rectangle(
                 *rect,
                 outline="#ffcc33" if is_current else "#c9a227",
@@ -2208,6 +2766,9 @@ class PdfParagraphEditor(tk.Tk):
         self.current_page_index = 0
         self.find_matches = []
         self.find_index = -1
+        self.history.clear()
+        self._drag_history_snapshot = None
+        self._nudge_undo_open = False
         self.file_label.config(text=os.path.basename(path))
         self.update_recent_panel(path)
         self.editor.delete("1.0", tk.END)
@@ -2215,7 +2776,12 @@ class PdfParagraphEditor(tk.Tk):
         self.refresh_tool_button_states()
         self.refresh_page_thumbnails()
         self.refresh_outlines()
-        self.render_current_page()
+        if self.settings.fit_on_open:
+            self.render_current_page()
+            self.fit_page_to_window()
+        else:
+            self.zoom = float(self.settings.default_zoom)
+            self.render_current_page()
         self.update_status_bar(f"Đã mở {os.path.basename(path)}")
 
         if not self.blocks:
@@ -2468,6 +3034,7 @@ class PdfParagraphEditor(tk.Tk):
             block = self.get_block(self.selected_block_id) if self.selected_block_id is not None else None
             if block is not None:
                 start_rect = self.expanded_text_rect(block)
+                self._drag_history_snapshot = self.capture_history_snapshot()
                 self.resize_state = {
                     "block_id": block.id,
                     "handle": handle,
@@ -2488,6 +3055,7 @@ class PdfParagraphEditor(tk.Tk):
             return
         self.select_block(clicked.id)
         # Keep original rect until user actually moves/resizes — do not expand permanently.
+        self._drag_history_snapshot = self.capture_history_snapshot()
         self.move_state = {
             "block_id": clicked.id,
             "start_rect": copy.copy(self.expanded_text_rect(clicked)),
@@ -2597,23 +3165,32 @@ class PdfParagraphEditor(tk.Tk):
             block = self.get_block(self.resize_state["block_id"])
             self.resize_state = None
             if block is not None:
+                if self._drag_history_snapshot is not None:
+                    self.history.push("Đổi kích thước box", self._drag_history_snapshot)
+                    self._drag_history_snapshot = None
                 self.select_block(block.id)
                 self.block_info.config(
                     text=f"Trang {block.page_index + 1} | Block #{block.id} | đã đổi kích thước {block.rect.width:.0f} x {block.rect.height:.0f} pt, chưa lưu file"
                 )
                 self.render_current_page()
+            else:
+                self._drag_history_snapshot = None
             return "break"
         if self.move_state:
             block = self.get_block(self.move_state["block_id"])
             moved = self.move_state.get("moved", False)
             self.move_state = None
             if block is not None and moved:
+                if self._drag_history_snapshot is not None:
+                    self.history.push("Di chuyển box", self._drag_history_snapshot)
+                    self._drag_history_snapshot = None
                 self.select_block(block.id)
                 self.block_info.config(
                     text=f"Trang {block.page_index + 1} | Block #{block.id} | đã di chuyển tới x={block.rect.x0:.0f}, y={block.rect.y0:.0f} pt, chưa lưu file"
                 )
                 self.render_current_page()
                 return "break"
+            self._drag_history_snapshot = None
         return None
 
     def constrain_rect_to_page(self, rect: fitz.Rect, page_index: int) -> fitz.Rect:
@@ -2654,6 +3231,7 @@ class PdfParagraphEditor(tk.Tk):
         color = self.color_var.get() or "#000000"
         bold = bool(self.bold_var.get())
         italic = bool(self.italic_var.get())
+        self.record_history("Chèn text mới")
         block = TextBlock(
             id=block_id,
             page_index=self.current_page_index,
@@ -2888,6 +3466,8 @@ class PdfParagraphEditor(tk.Tk):
             self.destroy_inplace_editor(commit=False)
             return
         new_text = self.inplace_text.get("1.0", "end-1c")
+        if new_text != block.text or apply_styles_from_panel:
+            self.record_history("Sửa text (tại chỗ)")
         self.destroy_inplace_editor(commit=False)
         self._apply_text_to_block(block, new_text, apply_styles_from_panel=apply_styles_from_panel, from_inplace=True)
         self.render_current_page()
@@ -2973,6 +3553,7 @@ class PdfParagraphEditor(tk.Tk):
                 return
             new_text = self.inplace_text.get("1.0", "end-1c")
             styles_changed = self._panel_styles_differ_from_block(block)
+            self.record_history("Sửa text")
             self.destroy_inplace_editor(commit=False)
             self._apply_text_to_block(block, new_text, apply_styles_from_panel=styles_changed, from_inplace=True)
             if styles_changed:
@@ -2997,6 +3578,7 @@ class PdfParagraphEditor(tk.Tk):
             return
         new_text = self.editor.get("1.0", tk.END).rstrip()
         styles_changed = self._panel_styles_differ_from_block(block)
+        self.record_history("Sửa text")
         self._apply_text_to_block(block, new_text, apply_styles_from_panel=styles_changed, from_inplace=False)
         if styles_changed:
             block.font_family = self.font_var.get() or block.font_family
@@ -3035,6 +3617,7 @@ class PdfParagraphEditor(tk.Tk):
         block = self.get_block(self.selected_block_id)
         if block is None:
             return
+        self.record_history("Xóa đoạn")
         if block.inserted:
             removed_id = block.id
             self.blocks = [item for item in self.blocks if item.id != removed_id]
@@ -3057,6 +3640,7 @@ class PdfParagraphEditor(tk.Tk):
         block = self.get_block(self.selected_block_id)
         if block is None:
             return
+        self.record_history("Khôi phục đoạn")
         if block.inserted:
             removed_id = block.id
             self.blocks = [item for item in self.blocks if item.id != removed_id]
@@ -3166,7 +3750,7 @@ class PdfParagraphEditor(tk.Tk):
     def on_viewer_button4(self, event):
         state = int(getattr(event, "state", 0) or 0)
         if state & 0x0004:
-            return self.zoom_at_event(event, 0.15)
+            return self.zoom_at_event(event, float(self.settings.zoom_step))
         if state & 0x0001:
             return self._viewer_scroll_x(-1)
         return self._viewer_scroll_y(-1)
@@ -3174,7 +3758,7 @@ class PdfParagraphEditor(tk.Tk):
     def on_viewer_button5(self, event):
         state = int(getattr(event, "state", 0) or 0)
         if state & 0x0004:
-            return self.zoom_at_event(event, -0.15)
+            return self.zoom_at_event(event, -float(self.settings.zoom_step))
         if state & 0x0001:
             return self._viewer_scroll_x(1)
         return self._viewer_scroll_y(1)
@@ -3201,8 +3785,15 @@ class PdfParagraphEditor(tk.Tk):
             steps = -1 if delta > 0 else 1
         return steps
 
+    def zoom_in(self, _event=None):
+        self.change_zoom(float(self.settings.zoom_step))
+
+    def zoom_out(self, _event=None):
+        self.change_zoom(-float(self.settings.zoom_step))
+
     def on_ctrl_mousewheel_zoom(self, event):
-        delta = 0.15 if event.delta > 0 else -0.15
+        step = float(self.settings.zoom_step)
+        delta = step if event.delta > 0 else -step
         self.zoom_at_event(event, delta)
         return "break"
 

@@ -1,13 +1,48 @@
 import copy
+from collections import Counter
 
 import fitz
 
-from .font_manager import font_file_for_style
+from .font_manager import (
+    available_font_files,
+    font_file_for_style,
+    font_name_suggests_bold,
+    font_name_suggests_italic,
+    resolve_font_family,
+)
 from .models import TextBlock, TextStyleSpan
 from .text_layout import required_text_height, wrap_text_for_pdf
 
 
-def extract_text_blocks(doc: fitz.Document) -> list[TextBlock]:
+def color_to_hex(color) -> str:
+    """Convert PyMuPDF span color (int or rgb sequence) to #RRGGBB."""
+    if isinstance(color, (list, tuple)) and len(color) >= 3:
+        channels = list(color[:3])
+        if all(isinstance(c, float) and c <= 1.0 for c in channels):
+            channels = [int(round(c * 255)) for c in channels]
+        else:
+            channels = [int(max(0, min(255, c))) for c in channels]
+        return f"#{channels[0]:02x}{channels[1]:02x}{channels[2]:02x}"
+    if isinstance(color, int):
+        return f"#{color & 0xFFFFFF:06x}"
+    return "#000000"
+
+
+def span_is_bold(span: dict) -> bool:
+    flags = int(span.get("flags", 0) or 0)
+    font_name = span.get("font") or ""
+    return bool(flags & 2**4) or font_name_suggests_bold(font_name)
+
+
+def span_is_italic(span: dict) -> bool:
+    flags = int(span.get("flags", 0) or 0)
+    font_name = span.get("font") or ""
+    return bool(flags & 2**1) or font_name_suggests_italic(font_name)
+
+
+def extract_text_blocks(doc: fitz.Document, font_files: dict[str, str] | None = None) -> list[TextBlock]:
+    """Extract text blocks with original layout metrics and formatting."""
+    font_files = font_files or available_font_files()
     blocks: list[TextBlock] = []
     block_id = 1
     for page_index in range(len(doc)):
@@ -16,31 +51,119 @@ def extract_text_blocks(doc: fitz.Document) -> list[TextBlock]:
         for block in data.get("blocks", []):
             if block.get("type") != 0:
                 continue
-            lines = []
-            font_sizes = []
+
+            line_payloads: list[tuple[str, list[TextStyleSpan]]] = []
+            font_sizes: list[float] = []
+            families: list[str] = []
+            colors: list[str] = []
+            bold_votes = 0
+            italic_votes = 0
+
             for line in block.get("lines", []):
-                parts = []
+                pieces: list[str] = []
+                local_spans: list[TextStyleSpan] = []
+                cursor = 0
                 for span in line.get("spans", []):
                     span_text = span.get("text", "")
+                    if not span_text:
+                        continue
+                    family = resolve_font_family(span.get("font"), font_files)
+                    size = max(6.0, min(72.0, float(span.get("size", 11) or 11)))
+                    color = color_to_hex(span.get("color", 0))
+                    bold = span_is_bold(span)
+                    italic = span_is_italic(span)
+                    start = cursor
+                    end = cursor + len(span_text)
+                    local_spans.append(
+                        TextStyleSpan(
+                            start=start,
+                            end=end,
+                            bold=bold,
+                            italic=italic,
+                            font_size=size,
+                            font_family=family,
+                            text_color=color,
+                        )
+                    )
+                    pieces.append(span_text)
+                    cursor = end
                     if span_text.strip():
-                        parts.append(span_text)
-                        font_sizes.append(float(span.get("size", 11)))
-                if parts:
-                    lines.append("".join(parts).strip())
-            text = "\n".join(lines).strip()
-            if not text:
+                        weight = max(1, len(span_text.strip()))
+                        font_sizes.append(size)
+                        families.append(family)
+                        colors.append(color)
+                        bold_votes += int(bold) * weight
+                        italic_votes += int(italic) * weight
+
+                line_text = "".join(pieces).rstrip()
+                if not line_text.strip():
+                    continue
+                clipped = [
+                    TextStyleSpan(
+                        s.start,
+                        min(s.end, len(line_text)),
+                        s.bold,
+                        s.italic,
+                        s.font_size,
+                        s.font_family,
+                        s.text_color,
+                    )
+                    for s in local_spans
+                    if s.start < len(line_text)
+                ]
+                line_payloads.append((line_text, clipped))
+
+            if not line_payloads:
                 continue
+
+            style_spans: list[TextStyleSpan] = []
+            absolute = 0
+            line_texts: list[str] = []
+            for index, (line_text, local_spans) in enumerate(line_payloads):
+                for span in local_spans:
+                    style_spans.append(
+                        TextStyleSpan(
+                            absolute + span.start,
+                            absolute + span.end,
+                            span.bold,
+                            span.italic,
+                            span.font_size,
+                            span.font_family,
+                            span.text_color,
+                        )
+                    )
+                line_texts.append(line_text)
+                absolute += len(line_text)
+                if index < len(line_payloads) - 1:
+                    absolute += 1  # newline between lines
+
+            text = "\n".join(line_texts)
             font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 11.0
             normalized_font_size = max(6.0, min(font_size, 72.0))
+            family = Counter(families).most_common(1)[0][0] if families else resolve_font_family(None, font_files)
+            color = Counter(colors).most_common(1)[0][0] if colors else "#000000"
+            total_weight = max(1, sum(max(1, len(line.strip())) for line, _ in line_payloads))
+            bold = bold_votes * 2 >= total_weight
+            italic = italic_votes * 2 >= total_weight
+
             blocks.append(
                 TextBlock(
-                    block_id,
-                    page_index,
-                    fitz.Rect(block["bbox"]),
-                    text,
-                    text,
-                    normalized_font_size,
-                    normalized_font_size,
+                    id=block_id,
+                    page_index=page_index,
+                    rect=fitz.Rect(block["bbox"]),
+                    text=text,
+                    original_text=text,
+                    font_size=normalized_font_size,
+                    original_font_size=normalized_font_size,
+                    font_family=family,
+                    original_font_family=family,
+                    text_color=color,
+                    original_text_color=color,
+                    bold=bold,
+                    original_bold=bold,
+                    italic=italic,
+                    original_italic=italic,
+                    style_spans=style_spans,
                 )
             )
             block_id += 1
@@ -80,6 +203,44 @@ def padded_rect(rect: fitz.Rect, doc: fitz.Document | None, page_index: int, pad
     return padded
 
 
+def _style_spans_equal(a: list[TextStyleSpan] | None, b: list[TextStyleSpan] | None) -> bool:
+    left = a or []
+    right = b or []
+    if len(left) != len(right):
+        return False
+    for sa, sb in zip(left, right):
+        if (
+            sa.start != sb.start
+            or sa.end != sb.end
+            or sa.bold != sb.bold
+            or sa.italic != sb.italic
+            or (sa.font_size or 0) != (sb.font_size or 0)
+            or (sa.font_family or "") != (sb.font_family or "")
+            or (sa.text_color or "") != (sb.text_color or "")
+        ):
+            return False
+    return True
+
+
+def block_has_changes(block: TextBlock) -> bool:
+    return (
+        block.deleted
+        or (block.inserted and bool(block.text.strip()))
+        or block.manually_resized
+        or block.text != block.original_text
+        or abs(block.font_size - block.original_font_size) >= 0.01
+        or block.font_family != block.original_font_family
+        or block.text_color.lower() != block.original_text_color.lower()
+        or block.bold != block.original_bold
+        or block.italic != block.original_italic
+        or not _style_spans_equal(block.style_spans, block.original_style_spans)
+    )
+
+
+def changed_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+    return [block for block in blocks if block_has_changes(block)]
+
+
 def apply_blocks_to_pdf(
     doc: fitz.Document,
     blocks: list[TextBlock],
@@ -87,32 +248,20 @@ def apply_blocks_to_pdf(
     font_files: dict[str, str],
     pdf_font_path: str | None,
 ):
-    changed_blocks = [
-        block
-        for block in blocks
-        if (
-            block.deleted
-            or (block.inserted and block.text.strip())
-            or block.manually_resized
-            or block.text != block.original_text
-            or abs(block.font_size - block.original_font_size) >= 0.01
-            or block.font_family != "Arial"
-            or block.text_color != "#000000"
-            or block.bold
-            or block.italic
-            or bool(block.style_spans)
-        )
-    ]
-    for block in changed_blocks:
+    for block in changed_blocks(blocks):
         page = doc[block.page_index]
         rect = expanded_text_rect(block, source_doc)
         if not block.inserted:
             erase_rect = original_erase_rect(block) if block.manually_resized else rect
-            page.draw_rect(
+            page.add_redact_annot(
                 padded_rect(erase_rect, source_doc, block.page_index, 1),
-                color=(1, 1, 1),
-                fill=(1, 1, 1),
-                overlay=True,
+                fill=None,
+                cross_out=False,
+            )
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                text=fitz.PDF_REDACT_TEXT_REMOVE,
             )
         if block.deleted or not block.text.strip():
             continue

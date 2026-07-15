@@ -2,6 +2,9 @@
 
 Ứng dụng desktop Python để mở PDF như trình xem PDF bình thường, click trực tiếp vào đoạn text để sửa hoặc xóa, rồi xuất ra PDF mới.
 
+**Developer:** donpv  
+**Copyright © 2026 donpv. All rights reserved.**
+
 ## Cài đặt
 
 ```powershell
@@ -57,12 +60,14 @@ Hướng mở rộng:
 
 ## Giới hạn kỹ thuật
 
-PDF không lưu nội dung giống file Word. Bản MVP này:
+PDF không lưu nội dung giống file Word. Bản hiện tại:
 
 - Render trang PDF trực tiếp trong cửa sổ phần mềm.
 - Click vào đoạn text để chọn đoạn cần sửa.
-- Sửa nội dung trong panel bên phải, bấm `Áp dụng sửa`.
+- Sửa nội dung trong panel bên phải, bấm `Áp dụng`.
 - Bấm `Xóa đoạn` để xóa đoạn đã chọn.
 - Khi xuất, chương trình che vùng text cũ bằng nền trắng và ghi text mới lên trên.
+- Giao diện Phase A: menu, tooltip toolbar, status bar, welcome screen, find bar (`Ctrl+F`), phím tắt, recent files.
+- Phase B: thumbnail trang, tab Outlines (bookmark), chuột phải xoay/xóa trang, preview căn giữa, di chuyển box bằng mũi tên.
 
 Kết quả tốt nhất với PDF nền trắng, có text thật. PDF scan ảnh cần OCR riêng.

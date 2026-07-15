@@ -38,12 +38,20 @@ def required_text_height(text: str, font_size: float, max_width: float) -> float
 
 
 def fit_font_size(rect: fitz.Rect, text: str, preferred_size: float) -> float:
-    lines = text.splitlines() or [text]
-    estimated_chars_per_line = max(8, int(rect.width / max(preferred_size * 0.52, 1)))
-    wrapped_lines = sum(max(1, (len(line) // estimated_chars_per_line) + 1) for line in lines)
-    needed_height = wrapped_lines * preferred_size * 1.25
-    if needed_height <= rect.height:
-        return preferred_size
-    scaled_size = rect.height / max(1, wrapped_lines) / 1.25
-    return max(6.0, min(preferred_size, scaled_size))
+    if not text.strip() or rect.width <= 1 or rect.height <= 1:
+        return max(6.0, min(72.0, preferred_size))
 
+    min_size = 6.0
+    max_size = max(min_size, min(72.0, preferred_size))
+    if required_text_height(text, min_size, rect.width) > rect.height:
+        return min_size
+
+    low = min_size
+    high = max_size
+    for _ in range(12):
+        mid = (low + high) / 2
+        if required_text_height(text, mid, rect.width) <= rect.height:
+            low = mid
+        else:
+            high = mid
+    return max(min_size, min(max_size, low))
